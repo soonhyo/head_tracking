@@ -10,6 +10,7 @@ import sensor_msgs.point_cloud2 as pc2
 import mediapipe as mp
 import time
 from collections import deque
+import threading
 
 class ImageSegmentationNode:
     def __init__(self):
@@ -21,8 +22,11 @@ class ImageSegmentationNode:
         self.bridge = CvBridge()
 
         # Initialize MediaPipe Selfie Segmentation
-        self.base_options = mp.tasks.BaseOptions(model_asset_path='selfie_multiclass_256x256.tflite',
+        # self.base_options = mp.tasks.BaseOptions(model_asset_path='selfie_multiclass_256x256.tflite',
+        #                                          delegate=mp.tasks.BaseOptions.Delegate.CPU)
+        self.base_options = mp.tasks.BaseOptions(model_asset_path='selfie_segmenter.tflite',
                                                  delegate=mp.tasks.BaseOptions.Delegate.CPU)
+
         self.segmenter_options = mp.tasks.vision.ImageSegmenterOptions(base_options=self.base_options,
                                                                        output_category_mask=True)
         self.segmenter = mp.tasks.vision.ImageSegmenter.create_from_options(self.segmenter_options)
@@ -33,8 +37,8 @@ class ImageSegmentationNode:
         self.info_sub = message_filters.Subscriber(f'{self.camera_name}/aligned_depth_to_color/camera_info', CameraInfo)
 
         # ROS Publishers
-        self.pointcloud_pub = rospy.Publisher('segmented_pointcloud', PointCloud2, queue_size=10)
-        self.segmented_image_pub = rospy.Publisher('segmented_image', Image, queue_size=10)
+        self.pointcloud_pub = rospy.Publisher('segmented_pointcloud', PointCloud2, queue_size=1)
+        self.segmented_image_pub = rospy.Publisher('segmented_image', Image, queue_size=1)
 
         # Synchronize the messages
         self.ts = message_filters.ApproximateTimeSynchronizer([self.depth_sub, self.color_sub, self.info_sub], 10, 0.5)
@@ -44,9 +48,9 @@ class ImageSegmentationNode:
         self.device = o3c.Device("CUDA:0")  # 'CUDA:0' or 'CPU:0'
         self.voxel_size = 1.5 / 256
         self.block_resolution = 4
-        self.block_count = 10000
+        self.block_count = 5000
         self.depth_scale = 1000.0
-        self.depth_max = 1.0
+        self.depth_max = 0.5
         self.vbg = o3d.t.geometry.VoxelBlockGrid(
             attr_names=('tsdf', 'weight', 'color'),
             attr_dtypes=(o3c.float32, o3c.float32, o3c.float32),
@@ -77,28 +81,35 @@ class ImageSegmentationNode:
             self.depth_queue.append(depth_image)
             self.color_queue.append(color_image)
 
-            # Apply segmentation
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=color_image)
-            segmentation_result = self.segmenter.segment(mp_image)
-            category_mask = segmentation_result.category_mask.numpy_view()
-            mask = category_mask == 3  # Assuming the mask of interest is labeled as 1
-            self.mask_queue.append(mask)
+            # Apply segmentation in a separate thread
+            segmentation_thread = threading.Thread(target=self.apply_segmentation, args=(color_image,))
+            segmentation_thread.start()
+            segmentation_thread.join()  # Wait for the segmentation to complete
 
-            # Camera intrinsics
-            intrinsic = o3d.camera.PinholeCameraIntrinsic()
-            intrinsic.set_intrinsics(info_msg.width, info_msg.height, info_msg.K[0], info_msg.K[4], info_msg.K[2], info_msg.K[5])
-            intrinsic = o3d.core.Tensor(intrinsic.intrinsic_matrix, o3d.core.Dtype.Float64)
+            if len(self.mask_queue) > 0:
+                # Camera intrinsics
+                intrinsic = o3d.camera.PinholeCameraIntrinsic()
+                intrinsic.set_intrinsics(info_msg.width, info_msg.height, info_msg.K[0], info_msg.K[4], info_msg.K[2], info_msg.K[5])
+                intrinsic = o3d.core.Tensor(intrinsic.intrinsic_matrix, o3d.core.Dtype.Float64)
 
-            # Create debug segmented image
-            segmented_image = color_image.copy()
-            segmented_image[~mask] = 0
-            self.publish_segmented_image(segmented_image)
+                # Create debug segmented image
+                segmented_image = color_image.copy()
+                segmented_image[~self.mask_queue[-1]] = 0
+                self.publish_segmented_image(segmented_image)
 
-            # Integrate into voxel grid
-            self.integrate(intrinsic, self.depth_scale, self.depth_max, info_msg)
-
+                # Integrate into voxel grid
+                self.integrate(intrinsic, self.depth_scale, self.depth_max, info_msg)
+            else:
+                print("Mask queue is empty, skipping integration.")
         except CvBridgeError as e:
             rospy.logerr(e)
+
+    def apply_segmentation(self, color_image):
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=color_image)
+        segmentation_result = self.segmenter.segment(mp_image)
+        category_mask = segmentation_result.category_mask.numpy_view()
+        mask = category_mask == 0 # Assuming the mask of interest is labeled as 3
+        self.mask_queue.append(mask)
 
     def publish_pointcloud(self, pcd, camera_info):
         points = np.asarray(pcd.points)
@@ -149,14 +160,17 @@ class ImageSegmentationNode:
             extrinsic = np.eye(4)
             extrinsic = o3d.core.Tensor(extrinsic, o3d.core.Dtype.Float64)
 
-            frustum_block_coords = self.vbg.compute_unique_block_coordinates(
-                depth_o3d, intrinsic, extrinsic, depth_scale, depth_max)
+            try:
+                frustum_block_coords = self.vbg.compute_unique_block_coordinates(
+                    depth_o3d, intrinsic, extrinsic, depth_scale, depth_max)
 
-            self.vbg.integrate(frustum_block_coords, depth_o3d, color_o3d, intrinsic,
-                               intrinsic, extrinsic, depth_scale, depth_max)
-
+                self.vbg.integrate(frustum_block_coords, depth_o3d, color_o3d, intrinsic,
+                                   intrinsic, extrinsic, depth_scale, depth_max)
+            except RuntimeError as e:
+                # rospy.loginfo(f"Integration failed: {e}")
+                return
             dt = time.time() - start
-            rospy.loginfo(f'Finished integrating frames in {dt} seconds')
+            # rospy.loginfo(f'Finished integrating frames in {dt} seconds')
 
         pcd = self.vbg.extract_point_cloud().to_legacy()
         if not pcd.is_empty():
